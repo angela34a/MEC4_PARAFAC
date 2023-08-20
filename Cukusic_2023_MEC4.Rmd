@@ -1,0 +1,840 @@
+---
+title: "MEC4 - Lobau PARAFAC modelling"
+author: "Angela Cukusic"
+output:
+  html_document:
+    toc: true               # Table of contents
+    toc_float: true         # Keep the table of contents floating on the page
+    code_folding: hide      # Allow code folding in HTML output
+    code_download: true     # Enable code download button
+    code_copy: true         # Enable code copy button
+    number_sections: true   # Numbering the sections
+    theme: united           # Choose a Bootstrap theme (check available themes)
+    highlight: tango        # Syntax highlighting style (pick a style from available themes)
+
+
+  
+
+---
+
+
+
+# package loading
+```{r, warning=FALSE, results='hide'}
+library(staRdom)
+library(tidyverse)
+library(readxl)
+library(vegan)
+library("FactoMineR")
+library("factoextra") 
+
+```
+
+# Fluorescence data
+
+
+
+
+We should throughout all these steps be using the command: 
+"eem_overview_plot(nameX..., spp = ..., contour = TRUE)"
+to check between the steps the intermediate results, but since it is intensive,
+I do not do it for the markdown.
+
+
+
+
+## Data import
+Indicate path to data and number of cores for parallel processing.
+```{r, warning=FALSE, results='hold'}
+# path to aqualog .dat files
+sample_dir <- ("C:/Users/Angela Cukusic/Documents/faks/Ecology and Ecosystems/MEC-4 (Intro to research - s prof)/Data/flo_data") 
+
+# number of cores
+cores <- detectCores(logical = FALSE)
+
+# import data
+eem_list <- eem_read(sample_dir, import_function = "aqualog", recursive = TRUE)
+
+```
+
+
+## Process and correct
+Subtract blank from data (skip if already done in aqualog software, 
+but in our machine that is not the case).
+```{r, warning=FALSE, results='hold'}
+eem_list_blank_subtracted <- eem_extend2largest(eem_list, interpolation = 1, 
+                                                extend = FALSE, cores = cores)
+
+eem_list_blank_subtracted <- eem_remove_blank(eem_list_blank_subtracted)
+
+# 12 blanks averaged -> checks out since we did one full year of data
+```
+
+Normalize data to Raman Units relative to blank.
+```{r, warning=FALSE, results='hold'}
+# if blank subtraction done in previous step
+eem_list_rel_ru <- eem_raman_normalisation2(eem_list_blank_subtracted, blank = "blank")
+
+```
+
+At this point blanks are not needed anymore and can be removed from the sample list.
+```{r, warning=FALSE, results='hold'}
+eem_list_rel_ru <- eem_extract(eem_list_rel_ru, 
+                               c("nano", "miliq", "milliq", "mq", "blank"), 
+                               ignore_case = TRUE)
+```
+
+
+
+Remove Raman and Rayleigh scatter; 
+scatter width might need fine tuning to sufficiently mask scatter.
+```{r, warning=FALSE, results='hold'}
+eem_list_scatter_removed_1 <- eem_rem_scat(eem_list_rel_ru, 
+                                           remove_scatter = c(TRUE, TRUE, TRUE, TRUE),
+                                           remove_scatter_width = c(20, 15, 25, 15))
+
+# plot (go back and re-adjust scatter width if necessary)
+#eem_overview_plot(eem_list_scatter_removed_1, spp = 7, contour = TRUE)
+
+# or to plot each sample by one:
+# ggeem(eem_list_scatter_removed_1, contour = TRUE, fill_max = 1, spp=7)
+```
+
+Interpolate missing values after removing scatter.
+```{r, warning=FALSE, results='hold'}
+eem_list_interp_1 <-  eem_interp(eem_list_scatter_removed_1, 
+                                 cores = cores, type = 1, 
+                                 extend = FALSE)
+
+#summary(eem_list_interp_1)
+```
+
+Smooth data for peak picking.
+```{r, warning=FALSE, results='hold'}
+eem4peaks <- eem_smooth(eem_list_interp_1, n = 4, cores = cores)
+```
+
+## Peak picking
+Calculate Coble peaks and fluorescence indices.
+```{r, warning=FALSE, results='hold'}
+eem_indices_and_peaks <- as.data.frame(cbind(eem_biological_index(eem4peaks),
+                                 hix = eem_humification_index(eem4peaks)[, 2],
+                                 fi = eem_fluorescence_index(eem4peaks)[, 2],
+                                 eem_coble_peaks(eem4peaks)[, -1]))
+
+colnames(eem_indices_and_peaks) <- c(# keep the 1:4 colnames as they are
+                                     colnames(eem_indices_and_peaks)[1:4],
+                                     # add to b, t, a, m, c the prefix "coble_peak"
+                                     paste("coble_peak", colnames(eem_indices_and_peaks)[5:9], 
+                                           sep = "_"))
+
+
+
+```
+
+
+## PARAFAC modelling
+
+As before, apply spectral correction to remove scatter. But this time set the range even before starting, because we have too much scatter outside the 300-500 area: indicate range of EX and EM wavelengths to keep (everything above and below will be cut); values for ex and em might need some fine tuning.
+
+```{r, warning=FALSE, results='hold'}
+# cut data outside of indicated range
+eem_list_trimmed <- eem_list_rel_ru %>% eem_range(ex = c(260, Inf), em = c(300,560))
+
+# remove scatter
+eem_list_scatter_removed_2 <- eem_rem_scat(eem_list_trimmed, 
+                                           remove_scatter = c(TRUE, TRUE, TRUE, TRUE),
+                                           remove_scatter_width = c(20, 15, 25, 15))
+
+# continuosly go back and re-adjust ex if necessary, again I am saving the comp. power here
+#eem_overview_plot(eem_list_scatter_removed_2, spp = 7, contour = TRUE)
+
+```
+
+Remove  other remnant noise (in this example at EX 280-295 nm; again fine tune as needed).
+You can see the wobbly lines in the plot around this area so our goal is to remove that and interpolate the "straight" lines from the rest of the model.
+
+```{r, warning=FALSE, results='hold'}
+
+# with these just set the scatter areas as NAs
+eem_list_scatter_removed_2 <- eem_setNA(eem_list_scatter_removed_2, 
+                                        ex = 285:300, 
+                                        interpolate = FALSE)
+
+# with this interpolate the areas for smooth modeling
+eem_list_interp_2 <-  eem_interp(eem_list_scatter_removed_2, 
+                                 cores = cores, type = 1, 
+                                 extend = FALSE)
+
+```
+
+Still there is too much variation in emission values of some samples. It is most visible in October, which rather than being fixed should be thrown out alltogether.
+```{r, warning=FALSE, results='hold'}
+
+
+# with this identify the order number of October samples which show great variation 
+eem_list_scatter_removed_2 
+
+# its 3, 15, 27, 39, 51, 63, 75
+
+# identify in order to remove at emission wavelengths 319.645-330.957 nm which are the [13:20] emission interval
+
+# make them NAs
+eem_list_scatter_removed_2[64][[1]]$x[13:20, ] <- NA
+eem_list_scatter_removed_2[65][[1]]$x[13:20, ] <- NA
+eem_list_scatter_removed_2[66][[1]]$x[13:20, ] <- NA
+eem_list_scatter_removed_2[67][[1]]$x[13:20, ] <- NA
+eem_list_scatter_removed_2[68][[1]]$x[13:20, ] <- NA
+eem_list_scatter_removed_2[69][[1]]$x[13:20, ] <- NA
+eem_list_scatter_removed_2[70][[1]]$x[13:20, ] <- NA
+
+#interpolate the NAs
+eem_list_interp_2 <-  eem_interp(eem_list_scatter_removed_2, 
+                                 cores = cores, type = 1, 
+                                 extend = FALSE)
+
+#eem_overview_plot(eem_list_interp_2, spp = 7, contour = TRUE)
+```
+
+### Finding component number
+
+Set parameters.
+```{r, warning=FALSE, results='hold'}
+# range of components to look for 
+
+## minimum number of components 
+dim_min <- 3
+## maximum number of components
+dim_max <- 7
+
+# will produce models with 3, 4, 5, 6, or 7 components, respectively
+
+
+
+# number of random initialization from which the best model will be chosen
+nstart <- 50
+# maximum number of iterations
+maxit <- 5000
+# tolerance in parafac analysis (tolerated change in R2)
+ctol <- 10^-6
+```
+
+
+
+Calculate models (using constraints of non-negative fluorescence).
+```{r, warning=FALSE, results='hold'}
+pf_screen <- eem_parafac(eem_list_interp_2, 
+                            # how many components in model
+                         comps = seq(dim_min, dim_max),
+                         normalise = FALSE, 
+                            # we cannot have negative em/ex data
+                         const = c("nonneg", "nonneg", "nonneg"), 
+                         maxit = maxit, 
+                         nstart = nstart, 
+                         ctol = ctol, 
+                         cores = cores)
+
+# rescale data such that maximum of each component is 1. 
+pf_screen <- lapply(pf_screen, eempf_rescaleBC, newscale = "Fmax")
+```
+
+
+
+Check fit, peaks, and spectra of model components
+```{r, warning=FALSE, results='hold'}
+eempf_compare(pf_screen, contour = TRUE)
+```
+
+In this case, model3 with 5 components appears to give the best results 
+Check for correlations between components in model3 (there should be no strong correlations).
+```{r, warning=FALSE, results='hold'}
+
+eempf_corplot(pf_screen[[3]]) # comps 1 and 2  seem highly correlated
+```
+
+### Normalization
+Component 1 and 2 seem highly correlated; re-run the models with normalized data.
+```{r, warning=FALSE, results='hold'}
+# re-run
+pf_screen_norm <- eem_parafac(eem_list_interp_2, 
+                              comps = seq(dim_min, dim_max), 
+                              # with this we normalize the data, as opposed to before
+                              normalise = TRUE, 
+                              const = c("nonneg", "nonneg", "nonneg"), 
+                              maxit = maxit, 
+                              nstart = nstart, 
+                              ctol = ctol, 
+                              cores = cores)
+
+# rescale
+pf_screen_norm <- lapply(pf_screen_norm, eempf_rescaleBC, newscale = "Fmax")
+
+
+# check fit, peaks, and spectra
+eempf_compare(pf_screen_norm, contour = TRUE)
+```
+
+After normalization, model3 and model4 with 4 and 5 components, respectively, appear reasonable; check for correlations in both.
+```{r, warning=FALSE, results='hold'}
+# model2
+eempf_corplot(pf_screen_norm[[3]]) 
+
+# model3
+#eempf_corplot(pf_screen_norm[[4]]) 
+```
+
+### Screen outlier samples 
+There is possibility that certain samples have too much leverage in the model and 
+would be better for the model to remove them.
+Leverage ranges between 0 and 1 with very atypical wavelengths/samples having a leverage near 1.
+
+Leverage should be roughly similar across wavelengths/samples. 
+If points with high leverage are identified, those should be removed and the model should be re-calculated.
+```{r, warning=FALSE, results='hold'}
+# calculate leverage
+cpl <- eempf_leverage(pf_screen_norm[[3]])
+
+# plot
+eempf_leverage_plot(cpl, qlabel=0.1)
+
+# none of the samples have leverage bigger than 0.3 and I will not remove any 
+#####(exclude <- eempf_leverage_ident(cpl,qlabel=0.1))
+
+
+# however! at ex 330 there is a huge spike in moodels with 5+ componennts!
+# does not seem to be such a big problem with 4 components
+```
+
+
+
+### Check residuals
+Residuals should be random across samples and should not show major peaks or troughs 
+(small peaks along the diagonal are acceptable and may be ignored; mainly represent merely remnant scatter).
+```{r, warning=FALSE, eval=FALSE}
+eempf_residuals_plot(pf_screen_norm[[3]], 
+                     eem_list_interp_2, 
+                     residuals_only = TRUE, 
+                     spp = 7, 
+                     cores = cores, 
+                     contour = TRUE)
+```
+
+
+
+
+
+## Final model 
+Now that we are sure that all outliers are removed from the model, and that residuals are acceptable for this model we calculate a new model with increased accuracy. 
+
+
+I do not include this output in pdf because of the time needed.
+```{r, eval=FALSE}
+# decrease tolerance in R deviation
+ctol <- 10^-8 
+# increase number of random starts
+nstart = 60 
+# increase number of maximum interations
+maxit = 10000 
+# number of suitable components identified previously
+comps = 5 
+
+
+
+# calculate model with n components
+pf_n_components_1 <- eem_parafac(eem_list_interp_2, 
+                                 comps = comps, 
+                                 normalise = TRUE, 
+                                 const = c("nonneg", "nonneg", "nonneg"), 
+                                 maxit = maxit, 
+                                 nstart = nstart, 
+                                 ctol = ctol, 
+                                 output = "all", 
+                                 cores = cores)
+
+# re-scale
+pf_n_components_1 <- lapply(pf_n_components_1, eempf_rescaleBC, newscale = "Fmax")
+
+```
+
+
+
+```{r, eval=FALSE}
+
+# check convergence and model performance
+eempf_convergence(pf_n_components_1[[1]])
+
+# plot
+eempf_compare(pf_n_components_1, contour = TRUE)
+
+# check leverage
+eempf_leverage_plot(eempf_leverage(pf_n_components_1[[1]]))
+
+# check correlations
+eempf_corplot(pf_n_components_1[[1]], progress = FALSE)
+#comp 2 and 3 too correlated?
+```
+
+
+
+Re-calculate a new rough model with more restarts and lower accuracy.
+```{r, warning=FALSE, results='hold'}
+pf_n_components_2 <- eem_parafac(eem_list_interp_2, 
+                                 comps = 5, 
+                                 normalise = TRUE, 
+                                 const = c("nonneg", "nonneg", "nonneg"), 
+                                 maxit = maxit, 
+                                 nstart = 100, 
+                                 ctol = min(ctol*100,0.01), 
+                                 cores = cores)
+
+```
+
+
+Use the resulting model as starting point to re-calculate the high-accuracy model (nstarts can be lower here).
+```{r, warning=FALSE, results='hold'}
+pf_n_components_3 <- eem_parafac(eem_list_interp_2, 
+                                 comps = 5, 
+                                 normalise = TRUE, 
+                                 const = c("nonneg", "nonneg", "nonneg"), 
+                                 maxit = maxit, 
+                                 nstart = 10, 
+                                 ctol = ctol, 
+                                 cores = cores, 
+                                 Bstart = pf_n_components_2[[1]]$B, 
+                                 Cstart = pf_n_components_2[[1]]$C)
+
+pf_n_components_3 <- lapply(pf_n_components_3, eempf_rescaleBC, newscale = "Fmax")
+
+```
+
+Plot resulting components.
+```{r, warning=FALSE, results='hold'}
+eempf_comp_load_plot(pf_n_components_3[[1]], contour = TRUE)
+```
+
+
+## Split-half analysis
+Validate final model using split-half analysis (generates Tucker’s Congruence Coefficient; value should be close to one (and not smaller than ~0.9-0.85) for good consistent model).
+```{r, eval=FALSE}
+# this is again way too intensive to knit in a pdf
+
+#calculate split_half analysis
+sh <- splithalf(eem_list_interp_2, 
+                comps = 5, 
+                normalise = TRUE, 
+                rand = FALSE, 
+                cores = cores, 
+                nstart = nstart, 
+                maxit = maxit, 
+                ctol = ctol)
+
+splithalf_plot(sh)
+splithalf_tcc(sh)
+```
+
+
+## Visualize components
+
+Calculate "amount" of components per sample.
+```{r, warning=FALSE, results='hold'}
+pf_missing_samples <- A_missing(eem_list_interp_1, pf_n_components_3[[1]])
+final_comp_table <- as.data.frame(eempf4analysis(pf_missing_samples, eem4peaks))
+
+
+comp_table <- final_comp_table %>% as.data.frame() %>% 
+  dplyr::select("sample", "Comp.1", "Comp.2", "Comp.3", "Comp.4", "Comp.5") %>% 
+  
+  mutate( well_id = str_sub(sample, start = 1, end = 3),
+          date = str_split(sample, "_", simplify = TRUE)[, 2],
+          water_kind = case_when( str_detect(sample, "p") ~ "pumped", # for pumped
+                                  str_detect(sample, "w") ~ "well", # for well
+                                  TRUE ~ "surface") ) %>%              # for surface
+ 
+   mutate(date = ymd(date))
+
+
+
+```
+
+Absolute concentrations
+```{r, warning=FALSE, results='hold'}
+comp_table %>% 
+  dplyr::filter(water_kind != "well") %>% 
+  mutate(date = as.factor(date),
+         water_kind = as.factor(water_kind)) %>% 
+  dplyr::select(!c( "well_id", "sample")) %>% 
+  pivot_longer(cols = -c(date, water_kind), names_to = "comps", values_to = "concs") %>% 
+  mutate(comps = as.factor(comps))     %>% 
+ # find average from all three groundwater wells 
+  group_by(date, comps, water_kind) %>% 
+  summarise(concs = mean(concs)) %>% 
+  ungroup() %>% 
+  ggplot(aes(x = date, y = concs, fill = comps)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ water_kind, ncol = 1) + 
+  geom_text(aes(label = paste0(round(concs, 4) )), 
+            position = position_stack(vjust = 0.5), size = 2.5) +
+  theme(legend.position = "none",
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank()) +
+  theme_bw() + 
+  scale_fill_brewer(palette = "Set2") +
+  labs(x=NULL, y=NULL) +
+  scale_x_discrete(labels = c("Aug", "Sep", "Oct", "Nov", "Dec",
+                              "Jan", "Feb", "Mar", "Apr", "May", 
+                              "Jun", "Jul")) -> plt2
+
+plt2
+
+```
+
+Relative concentrations
+```{r, warning=FALSE, results='hold'}
+
+
+comp_table %>% 
+  mutate(date = as.factor(date),
+         water_kind = as.factor(water_kind)) %>% 
+  dplyr::select(!c( "well_id", "sample")) %>% 
+  pivot_longer(cols = -c(date, water_kind), names_to = "comps", values_to = "concs") %>% 
+  mutate(comps = as.factor(comps))     %>% 
+ # find average from all three groundwater wells 
+  group_by(date, comps, water_kind) %>% 
+  summarise(concs = mean(concs)) %>% 
+  ungroup() %>% 
+ # find  relative abundances for each date in each water kind (well/pump/surf)
+  group_by(date, water_kind) %>%
+  mutate(rel_conc = concs / sum(concs) * 100) %>%
+  ungroup() %>% 
+  ggplot(aes(x = date, y = rel_conc, fill = comps)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ water_kind, ncol = 1) + 
+  geom_text(aes(label = paste0(round(rel_conc, 4) , "%")), 
+            position = position_stack(vjust = 0.5), size = 4) +
+  theme(legend.position = "none",
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank()) +
+  theme_bw() + 
+  scale_fill_brewer(palette = "Set2") +
+  labs(x=NULL, y=NULL) +
+  scale_x_discrete(labels = c("Aug", "Sep", "Oct", "Nov", "Dec",
+                              "Jan", "Feb", "Mar", "Apr", "May", 
+                              "Jun", "Jul")) -> plt1
+
+plt1
+
+```
+
+```{r, warning=FALSE, results='hold'}
+
+comp_table %>% 
+  dplyr::filter(water_kind != "well") %>% 
+  mutate(date = as.factor(date),
+         water_kind = as.factor(water_kind)) %>% 
+  dplyr::select(!c( "well_id", "sample")) %>% 
+  pivot_longer(cols = -c(date, water_kind), 
+               names_to = "comps", values_to = "concs") %>% 
+  mutate(comps = as.factor(comps)) %>% 
+  # find average from all three groundwater wells 
+  group_by(date, comps, water_kind) %>% 
+  summarise(concs = mean(concs)) %>% 
+  ungroup() %>% 
+  
+  
+  ggplot(aes(x = date, y = concs, color = water_kind, group =water_kind)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~ comps) + 
+  theme(legend.position = "none",
+        axis.ticks.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank()) +
+  theme_bw() + 
+  scale_fill_brewer(palette = "Set2") +
+  labs(x=NULL, y=NULL) +
+  scale_x_discrete(labels = c("Aug", "Sep", "Oct", "Nov", "Dec",
+                              "Jan", "Feb", "Mar", "Apr", "May", 
+                              "Jun", "Jul")) -> plt3
+
+plt3
+```
+
+
+
+Get table with excitation/emission wavelengths for each component to identify excitation/emission maxima.
+```{r, warning=FALSE, results='hold'}
+comp_spectra <- eempf_export(pf_n_components_3[[1]])
+
+# just look at which ex and em values is the Comp at 1, for example Comp1 has the exctation maxima (1) at 260 nm 
+```
+
+
+
+
+
+# Environmental data
+```{r, warning=FALSE, results='hold'}
+# load environmental data
+env_data <- read_excel("C:/Users/Angela Cukusic/Documents/faks/Ecology and Ecosystems/MEC-4 (Intro to research - s prof)/Data/lobau_data_combined.xlsx")
+env_data1 <- env_data  %>% 
+  # temperature and oxygen are in two different columns for gw and sw
+  mutate(oxygen = coalesce( oxygen_mg_L , oxygen_above_bottom_mg_L),
+         temp = coalesce( temp_C , temp_above_bottom_C) ) %>% 
+  # remove unneccessary columns
+  dplyr::select(!c("well_id", "date_mm_dd_yyyy", "sample_type", 
+                              "atp_total_pM", "oxygen_below_gw_surface_mg_L", 
+                              "temp_below_gw_surface_C", "delta_13ch4_permille",
+                              "sd_delta_13ch4", "oxygen_mg_L" , 
+                              "oxygen_above_bottom_mg_L",
+                              "temp_C" , "temp_above_bottom_C")) %>% 
+  left_join(comp_table, ., by= c("sample" = "sample_id")) %>% 
+  # remove data on depth since it would remove all the surface water entries
+  select(! matches("depth|table") ) %>% 
+  # few moths do not have measured parameters, remove those
+  na.omit()
+
+ rownames(env_data1) <- env_data1$sample 
+
+# load amino acid data
+
+```
+
+Peform PCA on environmental variables to see if something can be simplified.
+It would be good to this considering there is almost more explanatory variables than our samples which provides an over-fitted model and gives no coherent results.
+
+```{r, warning=FALSE, results='hold'}
+
+library(caret)
+
+# 1. Calculate the correlation matrix to first simplify the highly correlated ones
+cor_matrix <- cor(env_data1[,-c(1:9)])
+
+# Find highly correlated variables with a threshold of 0.9
+highly_correlated <- findCorrelation(cor_matrix, cutoff = 0.8)
+
+# Remove the highly correlated variables from the dataframe
+df_pca <- env_data1[,-c(1:9)][, -highly_correlated]
+
+# Perform PCA on the preprocessed dataframe (df_pca)
+pca_env <- prcomp(df_pca, scale = TRUE)
+
+
+biplot(pca_env)
+# if there is one sample that is way different than all the rest which I would like to remove
+#tidy(pca_env) %>% filter(PC == "1") %>% filter(value > 5) %>% select("row")
+
+# but seems not
+
+
+# 2. Look at which components it makes sense to keep for further analyisis
+# usually those that contribute more than 1 eigenvalue
+
+# Get the eigenvalues of components (the st.dev)
+summary(pca_env) # the first 7 components have have more than 1 
+```
+
+
+
+normal data: variance = (st.dev)^2
+pca data:  eigenvalue = (st.dev)^2
+
+"eigenvalues represent the variance explained by each principal component" -> eigen ~ variance
+
+The first eight components explain more than 1 variance in data, but only the first three explaine more than 1% of variance so only keep PC1, PC2 and PC3 (as combinations of environmental variables) for further analysis.
+
+Now see what contributes to each of the three PCs and if some environmental variables can be removed.
+```{r, warning=FALSE, results='hold'}
+library(broom)
+
+# Extract the loadings from the PCA result and convert to tidy format
+loadings_df <-   tidy(pca_env, matrix = "rotation")
+
+
+
+# PC1
+# Create the ggplot2 object for plotting the loadings
+loadings_df %>% filter(PC == "1") %>% 
+  #x=reorder(class,-amount,sum)
+ggplot( aes(x = reorder(column, -value), y = value, group = factor(column))) +
+  geom_bar(stat = "identity", position = "dodge", 
+           fill= "gray90", color = "gray20") +
+  geom_text(aes(label = column), position = position_dodge(width = 0.9), 
+            #vjust = "inward",  
+            angle = 90 , hjust = "inward") +
+  labs(x = "Variables of PC1", y = "Loadings") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        legend.position = "none")
+
+# DOC and minerals
+
+
+```
+
+```{r, warning=FALSE, results='hold'}
+# PC2 
+loadings_df %>% filter(PC == "2") %>% 
+  #x=reorder(class,-amount,sum)
+ggplot( aes(x = reorder(column, -value), y = value, group = factor(column))) +
+  geom_bar(stat = "identity", position = "dodge", 
+           fill= "gray90", color = "gray20") +
+  geom_text(aes(label = column), position = position_dodge(width = 0.9), 
+            #vjust = "inward",  
+            angle = 90 , hjust = "inward") +
+  labs(x = "Variables of PC2", y = "Loadings") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        legend.position = "none")
+
+
+```
+
+
+```{r, warning=FALSE, results='hold'}
+# PC3
+loadings_df %>% filter(PC == "3") %>% 
+  #x=reorder(class,-amount,sum)
+ggplot( aes(x = reorder(column, -value), y = value, group = factor(column))) +
+  geom_bar(stat = "identity", position = "dodge", 
+           fill= "gray90", color = "gray20") +
+  geom_text(aes(label = column), position = position_dodge(width = 0.9), 
+            #vjust = "inward",  
+            angle = 90 , hjust = "inward") +
+  labs(x = "Variables of PC3", y = "Loadings") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        legend.position = "none")
+
+# PC3 consists 60%+ of co2, atp, P, N
+
+
+
+
+```
+
+
+
+seems that the variables not represented on the PC1 and PC2 are represented on PC3, should still keep all three
+
+```{r, warning=FALSE, results='hold'}
+
+fviz_pca_biplot(pca_env, 
+                # Fill individuals by groups
+                geom.ind = "point",
+                pointshape = 21,
+                pointsize = 2.5,
+                fill.ind = env_data1$well_id,
+                col.ind = "black",
+                alpha.var ="contrib",
+                col.var = "contrib",
+                gradient.cols = "RdBu",
+                repel = TRUE)+
+  ggpubr::fill_palette("jco")      
+```
+
+
+
+Make constrained analysis finally.
+```{r, warning=FALSE, results='hold'}
+# find coordinates 
+# i did not scale since they are more or less the same scale as coordinates
+tidy(pca_env) %>% filter(PC %in% c("1", "2", "3", "4", "5", "6") )  %>% 
+  pivot_wider(values_from = "value", names_from = "PC") %>% 
+  rename("PC1" = "1", "PC2" = "2", "PC3" = "3", 
+         "PC4" ="4", "PC5" = "5", "PC6" = "6") %>% 
+  arrange(desc(row)) %>% 
+  column_to_rownames("row")-> env.dat
+
+env_data1[,1:6] %>% 
+  #filter(sample != "D05p_20200729") %>% 
+  arrange(desc(sample)) %>% 
+  select(!"sample")-> sp.dat
+
+identical(rownames(env.dat), rownames(sp.dat)) #TRUE
+
+
+
+simpleRDA <- capscale(sp.dat ~  ., data=env.dat ,
+                 distance = "euclidean")
+
+#summary(simpleRDA)
+#64%% constrained 
+
+
+
+```
+Test if any of these PCs impacts the composition of DOC components 
+```{r, warning=FALSE, results='hold'}
+# Test of all canonical axes
+anova.model <- anova.cca(simpleRDA, by='axis', step=1000)  # cap1 is sign, cap2 also
+
+# test the whole model
+anova.model2 <- anova.cca(simpleRDA, step=1000) #is sign
+RsquareAdj(simpleRDA)$adj.r.squared # and explains 60%
+
+
+# test env paameters
+anova.model3 <- anova(simpleRDA, step=1000, by = "term")
+# PC1, PC3, PC4 and PC5 sign
+
+
+# new model
+
+simpleRDA <- capscale(sp.dat ~  PC1 + PC3 + PC4 + PC5, data=env.dat ,
+                 distance = "euclidean")
+```
+
+Only PC1 is significantly explaining the impact on the component composition, and explains 40% of variation. The PC1 is a combination of DOC (as expected), ec, oxygen, K, Na, co2. The nutrent availability does not seem to be impactful for the  DOC composition of the sample.
+```{r, warning=FALSE, results='hold'}
+# vectors
+ccavectors <- as.matrix(scores(simpleRDA, display = "bp", scaling = "sites")*2.363299) %>%
+  as.data.frame()
+
+# site coordinates
+env_data1[#which(rownames(env_data1) != "D05p_20200729")
+  ,"well_id"] %>% 
+  as.data.frame() %>% 
+  rename("water_kind" = ".") %>% 
+  arrange(desc(water_kind)) -> water
+
+site_data <- scores(simpleRDA, display = "sites") %>% 
+  as.data.frame() %>% 
+  cbind(., water)
+ 
+# add components
+comp <- as.matrix(scores(simpleRDA, display = "species")*2.363299 )  %>% 
+  as.data.frame()
+
+# plotting
+plot_cca <- 
+  site_data %>% 
+  ggplot( aes(x = CAP1, y = CAP2)) +
+  geom_point(aes( color= water_kind), size = 3) +
+  geom_point(color = "black", shape = 21, size = 3) +  
+  geom_segment(data = ccavectors, aes(x = 0, y = 0, xend = CAP1, yend = CAP2), 
+               size = 1.2,
+               arrow = arrow(length = unit(0.5, "cm"))) +
+   geom_vline(xintercept = c(0), color = "grey70", linetype = 2) +
+   geom_hline(yintercept = c(0), color = "grey70", linetype = 2) +
+  geom_text(data = ccavectors, aes(x = CAP1*1.1, y = CAP2*1.5, 
+                                   label = rownames(ccavectors)),
+                                   #nudge_x = 0.3, nudge_y = 0.3
+                                   size=6 ) +
+  geom_text(data = comp, aes(x = CAP1, y=CAP2, label = rownames(comp))) + 
+  theme_bw() +
+  labs(x = "CAP1 [44.58 %]", y="CAP2 [1.55 %]") +
+  stat_ellipse(aes(color=water_kind), size = 1, alpha = 0.5) + 
+  #stat_ellipse(aes(fill = cat), geom="polygon", level=0.95, alpha=0.09) +
+  labs( color = "Water \nkind", fill = "water kind") +
+  
+     theme(legend.background = element_blank(),
+           legend.box.background = element_rect(colour = "gray")) +
+  scale_color_manual(values=c("#acc7d9","#5180a2","#3e647d","#d8b365"))
+
+plot_cca
+
+
+```
+Conclusion: component 4 is mostly related to the surface water, while component 1, 2 and 3 are closely related to PC1 defined environmenal variables, namely minerals. 
